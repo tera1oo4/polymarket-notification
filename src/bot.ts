@@ -1,6 +1,9 @@
 import TelegramBot from 'node-telegram-bot-api';
 import * as dotenv from 'dotenv';
-import { getUser, saveUser, deleteUser, setSleepUntil, isUserSleeping } from './database';
+import {
+    getUser, ensureUser, deleteUser, setSleepUntil, isUserSleeping,
+    getWallets, getWallet, addWallet, updateWallet, deleteWallet
+} from './database';
 import { UserManager } from './userManager';
 
 dotenv.config();
@@ -10,17 +13,7 @@ if (!token) throw new Error('TELEGRAM_BOT_TOKEN is required in .env');
 
 export const bot = new TelegramBot(token, { polling: true });
 
-// --- Registration state machine ---
-interface RegistrationState {
-    step: 'address' | 'api_key' | 'api_secret' | 'api_passphrase';
-    address?: string;
-    api_key?: string;
-    api_secret?: string;
-}
-
-const registrations = new Map<number, RegistrationState>();
-
-// --- Utility: split long Telegram messages ---
+// ─── Utility: split long Telegram messages ────────────────────────────────────
 const splitMessage = (text: string, maxLength = 4000): string[] => {
     if (text.length <= maxLength) return [text];
     const chunks: string[] = [];
@@ -37,16 +30,42 @@ const splitMessage = (text: string, maxLength = 4000): string[] => {
     return chunks;
 };
 
-// --- Create UserManager with notification callback ---
+/** Smart price formatter: shows enough decimals without unnecessary zeros */
+const fmtPrice = (price: number): string => {
+    if (price === 0) return '$0.00';
+    if (price >= 1) return `$${price.toFixed(2)}`;
+    if (price >= 0.01) return `$${price.toFixed(2)}`; // e.g. $0.05 for 5 cents
+    return `$${price.toFixed(4)}`; // e.g. $0.0015 for very small prices
+};
+
+const fmtPnl = (n: number): string => {
+    const sign = n >= 0 ? '+' : '';
+    return `${sign}$${Math.abs(n).toFixed(2)}`;
+};
+
+// ─── State machines ───────────────────────────────────────────────────────────
+interface RegState {
+    step: 'nickname' | 'address' | 'api_key' | 'api_secret' | 'api_passphrase';
+    editing?: boolean;   // true = adding/editing wallet, false = initial registration
+    walletId?: number;   // set when editing existing wallet
+    editField?: string;  // set when editing a single field
+    nickname?: string;
+    address?: string;
+    api_key?: string;
+    api_secret?: string;
+}
+
+// chatId → state
+const regStates = new Map<number, RegState>();
+
+// ─── UserManager ──────────────────────────────────────────────────────────────
 export const userManager = new UserManager((telegramId: string, message: string) => {
     bot.sendMessage(telegramId, message, { parse_mode: 'Markdown' }).catch(err => {
-        console.error(`[Bot] Failed to send notification to ${telegramId}:`, err.message);
+        console.error(`[Bot] Failed to notify ${telegramId}:`, err.message);
     });
 });
 
-// ==============================
-//  /start — Registration Flow
-// ==============================
+// ─── /start ───────────────────────────────────────────────────────────────────
 bot.onText(/\/start/, async (msg) => {
     const chatId = msg.chat.id;
     const telegramId = msg.from?.id.toString();
@@ -54,273 +73,340 @@ bot.onText(/\/start/, async (msg) => {
 
     const existing = await getUser(telegramId);
     if (existing) {
+        const wallets = await getWallets(telegramId);
         return bot.sendMessage(chatId,
-            '🚀 *You are already registered!*\n\n' +
-            '📊 *Commands:*\n' +
-            '• /portfolio — Your positions & P/L\n' +
-            '• /sleep — Mute notifications\n' +
-            '• /wakeup — Unmute notifications\n' +
-            '• /settings — Your account info\n' +
-            '• /logout — Delete account\n' +
-            '• /help — All commands',
+            `🚀 *Polymarket Monitor Bot*\n\n` +
+            `You have *${wallets.length}* wallet(s) monitored.\n\n` +
+            `📊 *Commands:*\n` +
+            `• /portfolio — Positions & P/L\n` +
+            `• /settings — Manage wallets & sleep\n` +
+            `• /sleep — Mute notifications\n` +
+            `• /wakeup — Unmute\n` +
+            `• /help — All commands`,
             { parse_mode: 'Markdown' }
         );
     }
 
-    registrations.set(chatId, { step: 'address' });
+    // Start registration
+    await ensureUser(telegramId);
+    regStates.set(chatId, { step: 'nickname' });
     bot.sendMessage(chatId,
         '👋 *Welcome to Polymarket Monitor Bot!*\n\n' +
-        'Let\'s set up your account. I\'ll need a few details.\n\n' +
-        '📍 *Step 1/4:* Send me your Polymarket wallet address (0x...)',
+        'Let\'s add your first wallet.\n\n' +
+        '🏷️ *Step 1/5:* Enter a nickname for this wallet (e.g. "Main", "Trading"):',
         { parse_mode: 'Markdown' }
     );
 });
 
-// ==============================
-//  /help
-// ==============================
+// ─── /help ────────────────────────────────────────────────────────────────────
 bot.onText(/\/help/, async (msg) => {
-    const chatId = msg.chat.id;
-    bot.sendMessage(chatId,
+    bot.sendMessage(msg.chat.id,
         '📊 *Polymarket Monitor Bot*\n\n' +
         '*Commands:*\n' +
-        '• `/start` — Register your account\n' +
-        '• `/portfolio` — View positions & P/L\n' +
-        '• `/sleep` — Mute notifications (30m / 1h / 4h / 8h)\n' +
-        '• `/wakeup` — Unmute notifications early\n' +
-        '• `/settings` — View your account info\n' +
-        '• `/logout` — Delete your account\n\n' +
-        '🔔 *Auto Notifications:*\n' +
-        '• Trade executions (WebSocket)\n' +
-        '• Position price/P/L/size changes (polling)\n' +
-        '• New positions opened\n' +
-        '• Positions closed/resolved',
+        '• `/start` — Register / main menu\n' +
+        '• `/portfolio` — View all positions\n' +
+        '• `/settings` — Manage wallets, sleep mode\n' +
+        '• `/sleep` — Mute notifications\n' +
+        '• `/wakeup` — Unmute\n' +
+        '• `/logout` — Delete your account\n' +
+        '• `/help` — This message\n\n' +
+        '*Auto Notifications:*\n' +
+        '• Trade fills (WebSocket)\n' +
+        '• Shares added/reduced (polling)',
         { parse_mode: 'Markdown' }
     );
 });
 
-// ==============================
-//  /portfolio
-// ==============================
+// ─── /portfolio ───────────────────────────────────────────────────────────────
 bot.onText(/\/portfolio/, async (msg) => {
     const chatId = msg.chat.id;
     const telegramId = msg.from?.id.toString();
     if (!telegramId) return;
 
-    const user = await getUser(telegramId);
-    if (!user) return bot.sendMessage(chatId, '⚠️ You are not registered. Use /start to set up.');
+    if (!(await getUser(telegramId))) {
+        return bot.sendMessage(chatId, '⚠️ Not registered. Use /start to set up.');
+    }
 
     const loadingMsg = await bot.sendMessage(chatId, '⏳ _Calculating portfolio..._', { parse_mode: 'Markdown' });
 
     try {
-        const portfolio = await userManager.getPortfolio(telegramId);
+        const grouped = await userManager.getPortfolio(telegramId);
+        const allPositions = grouped.flatMap(g => g.positions.map(p => ({ ...p, _wallet: g.wallet })));
 
-        if (!portfolio || portfolio.length === 0) {
+        if (!allPositions.length) {
             return bot.editMessageText('ℹ️ Your portfolio is currently empty.', {
-                chat_id: chatId,
-                message_id: loadingMsg.message_id,
+                chat_id: chatId, message_id: loadingMsg.message_id,
             });
         }
 
-        let response = '📊 *Your Portfolio Overview*\n\n';
-        let totalValue = 0;
-        let totalPnl = 0;
+        let response = '📊 *Portfolio Overview*\n\n';
+        let totalValue = 0, totalPnl = 0;
+        let lastWallet = '';
 
-        portfolio.forEach((p: any) => {
+        for (const p of allPositions) {
+            if (p._wallet !== lastWallet) {
+                if (lastWallet) response += '\n';
+                response += `🏦 *${p._wallet}*\n`;
+                lastWallet = p._wallet;
+            }
             const pnlEmoji = p.pnl >= 0 ? '📈' : '📉';
-            const pnlColor = p.pnl >= 0 ? '+' : '';
-            response += `📍 *${p.market}*\n` +
-                `    Outcome: \`${p.outcome || 'N/A'}\`\n` +
-                `    Size: ${p.size.toFixed(1)} @ $${p.avgPrice.toFixed(3)}\n` +
-                `    Now: $${p.currentPrice.toFixed(3)} | $${p.value.toFixed(2)}\n` +
-                `    ${pnlEmoji} P/L: ${pnlColor}$${p.pnl.toFixed(2)} (${pnlColor}${p.pnlPercent.toFixed(2)}%)\n\n`;
+            const pnlSign = p.pnl >= 0 ? '+' : '';
+            response += `\n📍 *${p.market}*\n` +
+                `   Outcome: \`${p.outcome || 'N/A'}\`\n` +
+                `   Size: ${p.size.toFixed(1)} @ ${fmtPrice(p.avgPrice)}\n` +
+                `   Now: ${fmtPrice(p.currentPrice)} | $${p.value.toFixed(2)}\n` +
+                `   ${pnlEmoji} P/L: ${pnlSign}$${p.pnl.toFixed(2)} (${pnlSign}${p.pnlPercent.toFixed(2)}%)\n`;
             totalValue += p.value;
             totalPnl += p.pnl;
-        });
+        }
 
-        const totalPnlEmoji = totalPnl >= 0 ? '🟢' : '🔴';
-        const totalPnlSign = totalPnl >= 0 ? '+' : '';
-        response += `───────\n` +
-            `💎 *Total Account Value:* $${totalValue.toFixed(2)}\n` +
-            `${totalPnlEmoji} *Net P/L:* ${totalPnlSign}$${totalPnl.toFixed(2)}`;
+        const totalEmoji = totalPnl >= 0 ? '🟢' : '🔴';
+        response += `\n───────\n` +
+            `💎 *Total Value:* $${totalValue.toFixed(2)}\n` +
+            `${totalEmoji} *Net P/L:* ${fmtPnl(totalPnl)}`;
 
         const chunks = splitMessage(response);
         await bot.editMessageText(chunks[0], {
-            chat_id: chatId,
-            message_id: loadingMsg.message_id,
-            parse_mode: 'Markdown',
+            chat_id: chatId, message_id: loadingMsg.message_id, parse_mode: 'Markdown',
         });
         for (let i = 1; i < chunks.length; i++) {
             await bot.sendMessage(chatId, chunks[i], { parse_mode: 'Markdown' });
         }
-    } catch (error) {
-        console.error('Error fetching portfolio:', error);
+    } catch (err) {
+        console.error('Portfolio error:', err);
         await bot.editMessageText('❌ Failed to fetch portfolio.', {
-            chat_id: chatId,
-            message_id: loadingMsg.message_id,
+            chat_id: chatId, message_id: loadingMsg.message_id,
         });
     }
 });
 
-// ==============================
-//  /sleep — Mute notifications
-// ==============================
-bot.onText(/\/sleep/, async (msg) => {
-    const chatId = msg.chat.id;
-    const telegramId = msg.from?.id.toString();
-    if (!telegramId) return;
-
-    const user = await getUser(telegramId);
-    if (!user) return bot.sendMessage(chatId, '⚠️ You are not registered. Use /start to set up.');
-
-    const sleeping = await isUserSleeping(telegramId);
-    if (sleeping) {
-        const until = user.sleep_until ? new Date(user.sleep_until * 1000) : null;
-        const timeStr = until ? until.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Moscow' }) : '?';
-        return bot.sendMessage(chatId,
-            `😴 You are already sleeping until *${timeStr} MSK*.\n\nUse /wakeup to unmute.`,
-            { parse_mode: 'Markdown' }
-        );
-    }
-
-    bot.sendMessage(chatId, '😴 *Sleep Mode*\n\nFor how long should I mute notifications?', {
-        parse_mode: 'Markdown',
-        reply_markup: {
-            inline_keyboard: [
-                [
-                    { text: '30 мин', callback_data: 'sleep_30' },
-                    { text: '1 час', callback_data: 'sleep_60' },
-                ],
-                [
-                    { text: '4 часа', callback_data: 'sleep_240' },
-                    { text: '8 часов', callback_data: 'sleep_480' },
-                ],
-                [
-                    { text: '❌ Отмена', callback_data: 'sleep_cancel' },
-                ],
-            ],
-        },
-    });
-});
-
-// ==============================
-//  /wakeup — Unmute notifications
-// ==============================
-bot.onText(/\/wakeup/, async (msg) => {
-    const chatId = msg.chat.id;
-    const telegramId = msg.from?.id.toString();
-    if (!telegramId) return;
-
-    const user = await getUser(telegramId);
-    if (!user) return bot.sendMessage(chatId, '⚠️ You are not registered. Use /start to set up.');
-
-    await setSleepUntil(telegramId, null);
-    bot.sendMessage(chatId, '☀️ *You are awake!* Notifications resumed.', { parse_mode: 'Markdown' });
-});
-
-// ==============================
-//  /settings — View account info
-// ==============================
+// ─── /settings ────────────────────────────────────────────────────────────────
 bot.onText(/\/settings/, async (msg) => {
     const chatId = msg.chat.id;
     const telegramId = msg.from?.id.toString();
     if (!telegramId) return;
 
-    const user = await getUser(telegramId);
-    if (!user) return bot.sendMessage(chatId, '⚠️ You are not registered. Use /start to set up.');
-
-    const sleeping = await isUserSleeping(telegramId);
-    const sleepStatus = sleeping
-        ? `😴 Sleeping until ${new Date(user.sleep_until! * 1000).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Moscow' })} MSK`
-        : '☀️ Active';
-
-    bot.sendMessage(chatId,
-        '⚙️ *Your Settings*\n\n' +
-        `📍 *Address:* \`${user.address}\`\n` +
-        `🔑 *API Key:* \`${user.api_key.substring(0, 8)}...${user.api_key.slice(-4)}\`\n` +
-        `📅 *Registered:* ${new Date(user.created_at * 1000).toLocaleDateString('ru-RU')}\n` +
-        `🔔 *Status:* ${sleepStatus}`,
-        { parse_mode: 'Markdown' }
-    );
+    if (!(await getUser(telegramId))) {
+        return bot.sendMessage(chatId, '⚠️ Not registered. Use /start to set up.');
+    }
+    await sendSettingsMenu(chatId, telegramId);
 });
 
-// ==============================
-//  /logout — Delete account
-// ==============================
-bot.onText(/\/logout/, async (msg) => {
+async function sendSettingsMenu(chatId: number, telegramId: string, editMsgId?: number) {
+    const wallets = await getWallets(telegramId);
+    const sleeping = await isUserSleeping(telegramId);
+
+    let text = '⚙️ *Settings*\n\n';
+    text += sleeping ? '😴 Notifications: *Muted*\n' : '☀️ Notifications: *Active*\n';
+    text += `\n📂 *Wallets (${wallets.length}):*\n`;
+    for (const w of wallets) {
+        text += `• \`${w.nickname}\` — ${w.address.slice(0, 6)}...${w.address.slice(-4)}\n`;
+    }
+
+    // Build inline keyboard with one button per wallet + add button
+    const keyboard: TelegramBot.InlineKeyboardButton[][] = wallets.map(w => ([
+        { text: `🏦 ${w.nickname}`, callback_data: `wallet_menu:${w.id}` }
+    ]));
+    keyboard.push([{ text: '➕ Add Wallet', callback_data: 'wallet_add' }]);
+
+    const replyMarkup = { inline_keyboard: keyboard };
+
+    if (editMsgId) {
+        await bot.editMessageText(text, {
+            chat_id: chatId, message_id: editMsgId,
+            parse_mode: 'Markdown',
+            reply_markup: replyMarkup,
+        } as TelegramBot.EditMessageTextOptions);
+    } else {
+        await bot.sendMessage(chatId, text, {
+            parse_mode: 'Markdown',
+            reply_markup: replyMarkup,
+        });
+    }
+}
+
+async function sendWalletMenu(chatId: number, walletId: number, editMsgId?: number) {
+    const w = await getWallet(walletId);
+    if (!w) return;
+
+    const text = `🏦 *Wallet: ${w.nickname}*\n\n` +
+        `📍 Address: \`${w.address.slice(0, 6)}...${w.address.slice(-4)}\`\n` +
+        `🔑 API Key: \`${w.api_key.slice(0, 8)}...\``;
+
+    const keyboard: TelegramBot.InlineKeyboardButton[][] = [
+        [{ text: '✏️ Rename', callback_data: `wallet_edit_nickname:${walletId}` }],
+        [{ text: '📍 Change Address', callback_data: `wallet_edit_address:${walletId}` }],
+        [{ text: '🔑 Change API Keys', callback_data: `wallet_edit_keys:${walletId}` }],
+        [{ text: '🗑️ Delete Wallet', callback_data: `wallet_delete_confirm:${walletId}` }],
+        [{ text: '⬅️ Back to Settings', callback_data: 'settings_back' }],
+    ];
+
+    const opts: any = { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard } };
+    if (editMsgId) {
+        await bot.editMessageText(text, { chat_id: chatId, message_id: editMsgId, ...opts });
+    } else {
+        await bot.sendMessage(chatId, text, opts);
+    }
+}
+
+// ─── /sleep ───────────────────────────────────────────────────────────────────
+bot.onText(/\/sleep/, async (msg) => {
+    const chatId = msg.chat.id;
+    const telegramId = msg.from?.id.toString();
+    if (!telegramId || !(await getUser(telegramId))) {
+        return bot.sendMessage(chatId, '⚠️ Not registered. Use /start.');
+    }
+    if (await isUserSleeping(telegramId)) {
+        return bot.sendMessage(chatId, '😴 Already in sleep mode. Use /wakeup to unmute.');
+    }
+    bot.sendMessage(chatId, '😴 *Sleep Mode* — For how long?', {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '30 мин', callback_data: 'sleep_30' }, { text: '1 час', callback_data: 'sleep_60' }],
+                [{ text: '4 часа', callback_data: 'sleep_240' }, { text: '8 часов', callback_data: 'sleep_480' }],
+                [{ text: '❌ Отмена', callback_data: 'sleep_cancel' }],
+            ],
+        },
+    });
+});
+
+// ─── /wakeup ──────────────────────────────────────────────────────────────────
+bot.onText(/\/wakeup/, async (msg) => {
     const chatId = msg.chat.id;
     const telegramId = msg.from?.id.toString();
     if (!telegramId) return;
-
-    const user = await getUser(telegramId);
-    if (!user) return bot.sendMessage(chatId, '⚠️ You are not registered.');
-
-    bot.sendMessage(chatId,
-        '⚠️ *Are you sure you want to delete your account?*\n\nAll your data will be removed.',
-        {
-            parse_mode: 'Markdown',
-            reply_markup: {
-                inline_keyboard: [
-                    [
-                        { text: '✅ Yes, delete', callback_data: 'logout_confirm' },
-                        { text: '❌ Cancel', callback_data: 'logout_cancel' },
-                    ],
-                ],
-            },
-        }
-    );
+    if (!(await getUser(telegramId))) return bot.sendMessage(chatId, '⚠️ Not registered.');
+    await setSleepUntil(telegramId, null);
+    bot.sendMessage(chatId, '☀️ *Awake!* Notifications resumed.', { parse_mode: 'Markdown' });
 });
 
-// ==============================
-//  Callback query handler (inline buttons)
-// ==============================
+// ─── /logout ──────────────────────────────────────────────────────────────────
+bot.onText(/\/logout/, async (msg) => {
+    const chatId = msg.chat.id;
+    const telegramId = msg.from?.id.toString();
+    if (!telegramId || !(await getUser(telegramId))) return;
+    bot.sendMessage(chatId, '⚠️ *Delete your account?* All wallets and data will be removed.', {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [[
+                { text: '✅ Yes, delete', callback_data: 'logout_confirm' },
+                { text: '❌ Cancel', callback_data: 'logout_cancel' },
+            ]],
+        },
+    });
+});
+
+// ─── Callback Query Handler ────────────────────────────────────────────────────
 bot.on('callback_query', async (query) => {
     const chatId = query.message?.chat.id;
+    const msgId = query.message?.message_id;
     const telegramId = query.from.id.toString();
+    const data = query.data || '';
     if (!chatId) return;
 
-    const data = query.data;
-    if (!data) return;
+    await bot.answerCallbackQuery(query.id);
 
-    // --- Sleep callbacks ---
+    // ── Sleep ──
     if (data.startsWith('sleep_')) {
         if (data === 'sleep_cancel') {
-            await bot.answerCallbackQuery(query.id, { text: 'Cancelled' });
-            return bot.editMessageText('👌 Sleep cancelled.', { chat_id: chatId, message_id: query.message?.message_id });
+            return bot.editMessageText('👌 Cancelled.', { chat_id: chatId, message_id: msgId });
         }
-
         const minutes = parseInt(data.replace('sleep_', ''), 10);
         const until = Math.floor(Date.now() / 1000) + minutes * 60;
         await setSleepUntil(telegramId, until);
-
-        const untilDate = new Date(until * 1000);
-        const timeStr = untilDate.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Moscow' });
-
-        await bot.answerCallbackQuery(query.id, { text: `Sleeping for ${minutes} min` });
+        const timeStr = new Date(until * 1000).toLocaleTimeString('ru-RU', {
+            hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Moscow'
+        });
         return bot.editMessageText(
-            `😴 *Notifications muted until ${timeStr} MSK*\n\nUse /wakeup to unmute early.`,
-            { chat_id: chatId, message_id: query.message?.message_id, parse_mode: 'Markdown' }
+            `😴 *Muted until ${timeStr} MSK*\nUse /wakeup to unmute early.`,
+            { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }
         );
     }
 
-    // --- Logout callbacks ---
+    // ── Logout ──
     if (data === 'logout_confirm') {
         userManager.stopUser(telegramId);
         await deleteUser(telegramId);
-        await bot.answerCallbackQuery(query.id, { text: 'Account deleted' });
-        return bot.editMessageText('✅ Your account has been deleted. Use /start to re-register.',
-            { chat_id: chatId, message_id: query.message?.message_id });
+        return bot.editMessageText('✅ Account deleted. Use /start to re-register.', {
+            chat_id: chatId, message_id: msgId,
+        });
     }
     if (data === 'logout_cancel') {
-        await bot.answerCallbackQuery(query.id, { text: 'Cancelled' });
-        return bot.editMessageText('👌 Logout cancelled.',
-            { chat_id: chatId, message_id: query.message?.message_id });
+        return bot.editMessageText('👌 Cancelled.', { chat_id: chatId, message_id: msgId });
+    }
+
+    // ── Settings back ──
+    if (data === 'settings_back') {
+        return sendSettingsMenu(chatId, telegramId, msgId);
+    }
+
+    // ── Wallet menu ──
+    if (data.startsWith('wallet_menu:')) {
+        const walletId = parseInt(data.split(':')[1], 10);
+        return sendWalletMenu(chatId, walletId, msgId);
+    }
+
+    // ── Add wallet ──
+    if (data === 'wallet_add') {
+        regStates.set(chatId, { step: 'nickname', editing: true });
+        return bot.editMessageText(
+            '➕ *Add Wallet*\n\n🏷️ Enter a nickname (e.g. "Secondary", "Degen"):',
+            { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }
+        );
+    }
+
+    // ── Edit nickname ──
+    if (data.startsWith('wallet_edit_nickname:')) {
+        const walletId = parseInt(data.split(':')[1], 10);
+        regStates.set(chatId, { step: 'nickname', editing: true, walletId, editField: 'nickname' });
+        return bot.sendMessage(chatId, '✏️ Enter a new nickname for this wallet:');
+    }
+
+    // ── Edit address ──
+    if (data.startsWith('wallet_edit_address:')) {
+        const walletId = parseInt(data.split(':')[1], 10);
+        regStates.set(chatId, { step: 'address', editing: true, walletId, editField: 'address' });
+        return bot.sendMessage(chatId, '📍 Enter the new wallet address (0x...):');
+    }
+
+    // ── Edit API keys ──
+    if (data.startsWith('wallet_edit_keys:')) {
+        const walletId = parseInt(data.split(':')[1], 10);
+        regStates.set(chatId, { step: 'api_key', editing: true, walletId, editField: 'keys' });
+        return bot.sendMessage(chatId, '🔑 Enter the new API Key:');
+    }
+
+    // ── Delete wallet confirm ──
+    if (data.startsWith('wallet_delete_confirm:')) {
+        const walletId = parseInt(data.split(':')[1], 10);
+        const w = await getWallet(walletId);
+        if (!w) return;
+        return bot.editMessageText(
+            `🗑️ *Delete "${w.nickname}"?* This cannot be undone.`,
+            {
+                chat_id: chatId, message_id: msgId, parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: '✅ Delete', callback_data: `wallet_delete:${walletId}` },
+                        { text: '❌ Cancel', callback_data: `wallet_menu:${walletId}` },
+                    ]],
+                },
+            }
+        );
+    }
+
+    // ── Delete wallet ──
+    if (data.startsWith('wallet_delete:')) {
+        const walletId = parseInt(data.split(':')[1], 10);
+        userManager.stopWallet(walletId);
+        await deleteWallet(walletId);
+        await bot.editMessageText('✅ Wallet deleted.', { chat_id: chatId, message_id: msgId });
+        return sendSettingsMenu(chatId, telegramId);
     }
 });
 
-// ==============================
-//  General message handler (Registration Flow)
-// ==============================
+// ─── Message Handler (Registration / Edit flows) ──────────────────────────────
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text?.trim();
@@ -329,84 +415,104 @@ bot.on('message', async (msg) => {
     const telegramId = msg.from?.id.toString();
     if (!telegramId) return;
 
-    const state = registrations.get(chatId);
-    if (!state) return; // Not in registration flow
+    const state = regStates.get(chatId);
+    if (!state) return;
 
-    switch (state.step) {
-        case 'address':
-            if (!text.startsWith('0x') || text.length < 10) {
-                return bot.sendMessage(chatId, '❌ Invalid address. Must start with 0x. Try again:');
-            }
-            state.address = text;
-            state.step = 'api_key';
-            bot.sendMessage(chatId,
-                '✅ Address saved!\n\n🔑 *Step 2/4:* Send me your *API Key*',
-                { parse_mode: 'Markdown' }
-            );
-            break;
+    // Delete message containing sensitive data (api keys)
+    const isSensitive = ['api_key', 'api_secret', 'api_passphrase'].includes(state.step);
+    if (isSensitive) {
+        try { await bot.deleteMessage(chatId, msg.message_id); } catch { }
+    }
 
-        case 'api_key':
-            state.api_key = text;
-            state.step = 'api_secret';
-            bot.sendMessage(chatId,
-                '✅ API Key saved!\n\n🔐 *Step 3/4:* Send me your *API Secret*',
-                { parse_mode: 'Markdown' }
-            );
-            break;
+    // ── Nickname step ──
+    if (state.step === 'nickname') {
+        state.nickname = text.slice(0, 20);
+        // If editing a single field
+        if (state.editField === 'nickname' && state.walletId) {
+            await updateWallet(state.walletId, { nickname: state.nickname });
+            regStates.delete(chatId);
+            await bot.sendMessage(chatId, `✅ Renamed to "${state.nickname}".`);
+            return sendWalletMenu(chatId, state.walletId);
+        }
+        state.step = 'address';
+        return bot.sendMessage(chatId, `📍 *Step 2/5:* Enter the wallet address (0x...):`, { parse_mode: 'Markdown' });
+    }
 
-        case 'api_secret':
-            state.api_secret = text;
-            state.step = 'api_passphrase';
-            bot.sendMessage(chatId,
-                '✅ API Secret saved!\n\n🛡️ *Step 4/4:* Send me your *API Passphrase*',
-                { parse_mode: 'Markdown' }
-            );
-            break;
+    // ── Address step ──
+    if (state.step === 'address') {
+        if (!text.startsWith('0x') || text.length < 20) {
+            return bot.sendMessage(chatId, '❌ Invalid address. Must start with 0x. Try again:');
+        }
+        state.address = text;
+        // If editing single field
+        if (state.editField === 'address' && state.walletId) {
+            await updateWallet(state.walletId, { address: text });
+            regStates.delete(chatId);
+            userManager.stopWallet(state.walletId);
+            const w = await getWallet(state.walletId);
+            if (w) userManager.startWallet(w);
+            await bot.sendMessage(chatId, '✅ Address updated.');
+            return sendWalletMenu(chatId, state.walletId);
+        }
+        state.step = 'api_key';
+        return bot.sendMessage(chatId, `🔑 *Step 3/5:* Enter your API Key:`, { parse_mode: 'Markdown' });
+    }
 
-        case 'api_passphrase':
-            const passphrase = text;
-            registrations.delete(chatId);
+    // ── API Key step ──
+    if (state.step === 'api_key') {
+        state.api_key = text;
+        state.step = 'api_secret';
+        return bot.sendMessage(chatId, `🔐 *Step 4/5:* Enter your API Secret:`, { parse_mode: 'Markdown' });
+    }
 
-            try {
-                await saveUser({
-                    telegram_id: telegramId,
-                    address: state.address!,
-                    api_key: state.api_key!,
-                    api_secret: state.api_secret!,
+    // ── API Secret step ──
+    if (state.step === 'api_secret') {
+        state.api_secret = text;
+        state.step = 'api_passphrase';
+        return bot.sendMessage(chatId, `🛡️ *Step 5/5:* Enter your API Passphrase:`, { parse_mode: 'Markdown' });
+    }
+
+    // ── Passphrase step ──
+    if (state.step === 'api_passphrase') {
+        const passphrase = text;
+        regStates.delete(chatId);
+
+        try {
+            // If editing all keys for an existing wallet
+            if (state.editField === 'keys' && state.walletId) {
+                await updateWallet(state.walletId, {
+                    api_key: state.api_key,
+                    api_secret: state.api_secret,
                     api_passphrase: passphrase,
                 });
-
-                // Start monitoring
-                userManager.startUser({
-                    telegramId,
-                    address: state.address!,
-                    apiKey: state.api_key!,
-                    apiSecret: state.api_secret!,
-                    apiPassphrase: passphrase,
-                });
-
-                // Delete the messages containing sensitive data
-                try {
-                    // Delete the last 6 messages (user inputs + bot prompts)
-                    await bot.deleteMessage(chatId, msg.message_id);
-                } catch { }
-
-                bot.sendMessage(chatId,
-                    '🎉 *Registration Complete!*\n\n' +
-                    '✅ Your credentials are encrypted and stored securely.\n' +
-                    '📡 Monitoring started! You will receive notifications about:\n' +
-                    '• Trade executions\n' +
-                    '• Position changes\n' +
-                    '• New positions / closures\n\n' +
-                    '📊 Use /portfolio to view your positions.\n' +
-                    '😴 Use /sleep to mute notifications.',
-                    { parse_mode: 'Markdown' }
-                );
-            } catch (error: any) {
-                console.error('Registration error:', error);
-                bot.sendMessage(chatId, '❌ Registration failed. Please try /start again.');
+                userManager.stopWallet(state.walletId);
+                const w = await getWallet(state.walletId);
+                if (w) userManager.startWallet(w);
+                await bot.sendMessage(chatId, '✅ API Keys updated.');
+                return sendWalletMenu(chatId, state.walletId);
             }
-            break;
+
+            // Add new wallet
+            const wallet = await addWallet(
+                telegramId,
+                state.nickname || 'Wallet',
+                state.address!,
+                state.api_key!,
+                state.api_secret!,
+                passphrase
+            );
+            userManager.startWallet(wallet);
+
+            bot.sendMessage(chatId,
+                `✅ *Wallet "${wallet.nickname}" added!*\n\n` +
+                `📡 Monitoring started.\n\n` +
+                `Use /settings to manage wallets or /portfolio to view positions.`,
+                { parse_mode: 'Markdown' }
+            );
+        } catch (err: any) {
+            console.error('Add wallet error:', err);
+            bot.sendMessage(chatId, '❌ Failed to save wallet. Use /settings to try again.');
+        }
     }
 });
 

@@ -1,81 +1,101 @@
 import { PolymarketService, PolymarketUserConfig } from './polymarketService';
-import { getAllUsers, isUserSleeping, UserRecord } from './database';
+import { getAllUsers, getWallets, isUserSleeping, WalletRecord } from './database';
 
 export class UserManager {
-    /** Active services keyed by Telegram user ID */
-    private services: Map<string, PolymarketService> = new Map();
+    /** Active services keyed by wallet ID (walletId → service) */
+    private services: Map<number, PolymarketService> = new Map();
 
-    /** Callback to send notifications to a specific Telegram user */
     private sendNotification: (telegramId: string, message: string) => void;
 
     constructor(sendNotification: (telegramId: string, message: string) => void) {
         this.sendNotification = sendNotification;
     }
 
-    /** Start monitoring for a specific user */
-    startUser(user: UserRecord | PolymarketUserConfig & { telegramId: string }) {
-        // Stop existing service if any
-        this.stopUser('telegram_id' in user ? user.telegram_id : user.telegramId);
+    /** Start monitoring for a specific wallet */
+    startWallet(wallet: WalletRecord) {
+        // Stop existing service for this wallet if any
+        this.stopWallet(wallet.id);
 
-        const telegramId = 'telegram_id' in user ? user.telegram_id : user.telegramId;
         const config: PolymarketUserConfig = {
-            telegramId,
-            address: 'telegram_id' in user ? user.address : user.address,
-            apiKey: 'telegram_id' in user ? user.api_key : user.apiKey,
-            apiSecret: 'telegram_id' in user ? user.api_secret : user.apiSecret,
-            apiPassphrase: 'telegram_id' in user ? user.api_passphrase : user.apiPassphrase,
+            telegramId: wallet.telegram_id,
+            address: wallet.address,
+            apiKey: wallet.api_key,
+            apiSecret: wallet.api_secret,
+            apiPassphrase: wallet.api_passphrase,
         };
 
         const service = new PolymarketService(config);
 
-        // Wire up notifications with sleep check
         service.on('trade', async (notification: string) => {
-            if (!(await isUserSleeping(telegramId))) {
-                this.sendNotification(telegramId, notification);
+            if (!(await isUserSleeping(wallet.telegram_id))) {
+                const header = `🏦 _[${wallet.nickname}]_\n`;
+                this.sendNotification(wallet.telegram_id, header + notification);
             }
         });
 
         service.on('position_update', async (notification: string) => {
-            if (!(await isUserSleeping(telegramId))) {
-                this.sendNotification(telegramId, notification);
+            if (!(await isUserSleeping(wallet.telegram_id))) {
+                const header = `🏦 _[${wallet.nickname}]_\n`;
+                this.sendNotification(wallet.telegram_id, header + notification);
             }
         });
 
-        // Start portfolio polling (every 5 seconds)
         service.startPortfolioPolling(5000);
 
-        this.services.set(telegramId, service);
-        console.log(`[UserManager] Started service for user ${telegramId}`);
+        this.services.set(wallet.id, service);
+        console.log(`[UserManager] Started wallet #${wallet.id} "${wallet.nickname}" for user ${wallet.telegram_id}`);
     }
 
-    /** Stop monitoring for a specific user */
-    stopUser(telegramId: string) {
-        const existing = this.services.get(telegramId);
+    /** Stop monitoring for a specific wallet */
+    stopWallet(walletId: number) {
+        const existing = this.services.get(walletId);
         if (existing) {
             existing.stop();
-            this.services.delete(telegramId);
-            console.log(`[UserManager] Stopped service for user ${telegramId}`);
+            this.services.delete(walletId);
+            console.log(`[UserManager] Stopped wallet #${walletId}`);
         }
     }
 
-    /** Get portfolio for a specific user */
-    async getPortfolio(telegramId: string) {
-        const service = this.services.get(telegramId);
-        if (!service) return null;
-        return service.getPortfolio();
+    /** Stop all wallets for a given Telegram user */
+    stopUser(telegramId: string) {
+        for (const [walletId, service] of this.services) {
+            if ((service as any).config?.telegramId === telegramId) {
+                service.stop();
+                this.services.delete(walletId);
+            }
+        }
     }
 
-    /** Restore all users from DB on startup */
+    /** Get combined portfolio for all wallets of a user */
+    async getPortfolio(telegramId: string): Promise<{ wallet: string; positions: any[] }[]> {
+        const result: { wallet: string; positions: any[] }[] = [];
+        for (const [walletId, service] of this.services) {
+            if ((service as any).config?.telegramId === telegramId) {
+                const positions = await service.getPortfolio();
+                const walletName = (service as any).config?.nickname || `Wallet #${walletId}`;
+                result.push({ wallet: walletName, positions });
+            }
+        }
+        return result;
+    }
+
+    /** Restore all wallet services from DB on startup */
     async restoreAll() {
         const users = await getAllUsers();
         console.log(`[UserManager] Restoring ${users.length} user(s) from database...`);
         for (const user of users) {
-            this.startUser(user);
+            const wallets = await getWallets(user.telegram_id);
+            for (const wallet of wallets) {
+                this.startWallet(wallet);
+            }
         }
     }
 
-    /** Check if a user has an active service */
+    /** Check if user has any active wallets */
     hasUser(telegramId: string): boolean {
-        return this.services.has(telegramId);
+        for (const [, service] of this.services) {
+            if ((service as any).config?.telegramId === telegramId) return true;
+        }
+        return false;
     }
 }
