@@ -1,8 +1,17 @@
 import axios from 'axios';
 import WebSocket from 'ws';
 import { EventEmitter } from 'events';
+import * as crypto from 'crypto';
 
 const POLYMARKET_HOST = 'https://clob.polymarket.com';
+
+function buildPolyHmacSignature(secret: string, timestamp: number, method: string, requestPath: string, body?: string): string {
+    const message = timestamp.toString() + method + requestPath + (body || '');
+    const secretBuffer = Buffer.from(secret, 'base64');
+    const hash = crypto.createHmac('sha256', secretBuffer);
+    hash.update(message);
+    return hash.digest('base64');
+}
 
 export interface PolymarketUserConfig {
     telegramId: string;
@@ -199,15 +208,26 @@ export class PolymarketService extends EventEmitter {
             console.log(`[User ${this.config.telegramId}] Connected to Polymarket WebSocket.`);
 
             try {
+                const timestamp = Math.floor(Date.now() / 1000);
+                const signature = buildPolyHmacSignature(
+                    this.config.apiSecret,
+                    timestamp,
+                    'GET',
+                    '/ws/user'
+                );
+
                 const subscribeMsg = {
+                    assets: [],
                     type: 'user',
                     auth: {
                         apiKey: this.config.apiKey,
-                        secret: this.config.apiSecret,
+                        signature: signature,
+                        timestamp: timestamp.toString(),
                         passphrase: this.config.apiPassphrase,
                     }
                 };
 
+                console.log(`[User ${this.config.telegramId}] Sending WS auth...`);
                 this.ws?.send(JSON.stringify(subscribeMsg));
 
                 const pingInterval = setInterval(() => {
@@ -225,13 +245,15 @@ export class PolymarketService extends EventEmitter {
         this.ws.on('message', (data: string) => {
             try {
                 const message = JSON.parse(data.toString());
+                console.log(`[User ${this.config.telegramId}] WS Msg:`, message.type || message.event_type || 'unknown');
+
                 if (message.type === 'subscription_start') {
                     console.log(`[User ${this.config.telegramId}] ✅ WS subscription confirmed.`);
                     this.reconnectionDelay = 5000;
                     this.wsFailureCount = 0;
                 }
-                if (message.type === 'error' && message.message?.includes('Unauthorized')) {
-                    console.error(`[User ${this.config.telegramId}] ❌ WS Auth Error:`, message.message);
+                if (message.type === 'error' || message.message?.includes('Unauthorized')) {
+                    console.error(`[User ${this.config.telegramId}] ❌ WS Error:`, message);
                     this.wsFailureCount++;
                 }
                 this.handleWsMessage(message);
