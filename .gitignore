@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment files (NEVER commit these)
+.env
+.env.local
+.env.*.local
+
+# Debug files
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temp / scratch files
+tmp.json
+src/debug.ts
+src/check_clock.ts
+src/derive_api_keys.ts
+src/verify_fix.ts
+src/raw_ws_debug.ts
+src/test_length.ts
+src/test_split.ts
+
+# TypeScript cache
+*.tsbuildinfo
+
+# IDE
+.vscode/
+.idea/
