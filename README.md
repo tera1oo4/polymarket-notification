@@ -122,3 +122,4 @@ Notifications are **only sent when shares change** — no spam from normal price
 ## License
 
 MIT
+# polymarket-notification
